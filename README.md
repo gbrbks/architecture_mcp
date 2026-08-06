@@ -123,7 +123,7 @@ The reviewer executes from the **base-ref copy** of `.archie/` (never PR-head co
 bash .archie/setup-archie-intent-review.sh
 ```
 
-The script checks prerequisites, prompts for your `ANTHROPIC_API_KEY` and stores it as an encrypted GitHub Actions secret (`gh secret set`), copies the canonical workflow to `.github/workflows/archie-intent-review.yml`, and probes that Actions is enabled. Then commit and push it:
+The script checks prerequisites, lets you pick the LLM provider (OpenRouter — one key, any model — or Anthropic direct), prompts for the matching API key and stores it as an encrypted GitHub Actions secret (`gh secret set`), copies the canonical workflow to `.github/workflows/archie-intent-review.yml`, and probes that Actions is enabled. Then commit and push it:
 
 ```bash
 git add .github/workflows/archie-intent-review.yml
@@ -131,7 +131,7 @@ git commit -m "ci: add Archie PR review"
 git push        # open a PR — the Action comments on it
 ```
 
-Runs `on: pull_request` (opened / synchronize), re-uses (PATCHes) its own comment on re-push, and needs only `ANTHROPIC_API_KEY` (the workflow uses the built-in `GITHUB_TOKEN`). Rotate the key later with `gh secret set ANTHROPIC_API_KEY`.
+Runs `on: pull_request` (opened / synchronize), re-uses (PATCHes) its own comment on re-push, and needs only one provider secret — `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY` (the workflow uses the built-in `GITHUB_TOKEN`). The reviewer auto-detects the provider from whichever secret exists (OpenRouter wins if both are set); no config file needed. To pin specific models per tier, commit an optional `.archie/models.json`. Rotate a key later with `gh secret set <SECRET_NAME>`.
 
 > **Fork-PR limitation:** the workflow uses the `pull_request` event (non-blocking FYI). Fork PRs cannot read repo secrets, so the Action **skips silently** on them. Covering fork PRs would require `pull_request_target`, a security tradeoff that's deliberately out of scope.
 

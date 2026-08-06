@@ -1,0 +1,6 @@
+{
+  "provider": "openrouter",
+  "models": {
+    "haiku": "deepseek/deepseek-v4-flash"
+  }
+}

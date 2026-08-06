@@ -377,44 +377,32 @@ def test_render_comment_groups_and_cites():
 # ---------------------------------------------------------------------------
 # model + github calls (monkeypatched urllib)
 # ---------------------------------------------------------------------------
-def test_extract_findings_from_tool_use():
-    resp = {"content": [
-        {"type": "text", "text": "ignore"},
-        {"type": "tool_use", "name": "emit_findings",
-         "input": {"findings": [{"item_ref": "c0", "type": "contradiction"}]}},
-    ]}
-    out = ir._extract_findings(resp)
-    assert out == [{"item_ref": "c0", "type": "contradiction"}]
-    assert ir._extract_findings({"content": []}) == []
+def test_call_anthropic_delegates_to_llm_client(monkeypatch):
+    seen = {}
+
+    def fake_complete(prompt, **kw):
+        seen.update(kw, prompt=prompt)
+        return {"text": "", "tool_calls": [
+            {"name": "emit_findings", "input": {"findings": [{"id": 1}]}}]}
+
+    monkeypatch.setattr(ir.llm_client, "complete", fake_complete)
+    out = ir.call_anthropic("SYS", "USER", "sk-key", max_retries=2)
+    assert out == [{"id": 1}]
+    assert seen["prompt"] == "USER"
+    assert seen["system"] == "SYS"
+    assert seen["tool_choice"] == "emit_findings"
+    assert seen["tools"] == [ir.EMIT_FINDINGS_TOOL]
+    assert seen["max_retries"] == 2
+    assert seen["tier"] == "haiku"
 
 
-def test_call_anthropic_parses_tool_use(monkeypatch):
-    class FakeResp:
-        def __init__(self, payload):
-            self._b = json.dumps(payload).encode()
-        def read(self):
-            return self._b
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
+def test_call_anthropic_wraps_llmerror(monkeypatch):
+    def boom(prompt, **kw):
+        raise ir.llm_client.LLMError("HTTP 500")
 
-    captured = {}
-
-    def fake_urlopen(req, timeout=0):
-        captured["url"] = req.full_url
-        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
-        return FakeResp({"content": [
-            {"type": "tool_use", "name": "emit_findings",
-             "input": {"findings": [{"item_ref": "c0", "type": "silent_weakening",
-                                     "rule_name": "x", "what_changed": "y", "because": "z"}]}}]})
-
-    monkeypatch.setattr(ir.urllib.request, "urlopen", fake_urlopen)
-    out = ir.call_anthropic("sys", "user", "sk-test")
-    assert out[0]["item_ref"] == "c0"
-    assert captured["url"] == ir.ANTHROPIC_URL
-    assert captured["headers"]["x-api-key"] == "sk-test"
-    assert captured["headers"]["anthropic-version"] == ir.ANTHROPIC_VERSION
+    monkeypatch.setattr(ir.llm_client, "complete", boom)
+    with pytest.raises(RuntimeError):
+        ir.call_anthropic("s", "u", "sk-key")
 
 
 def test_post_or_update_comment_creates_then_updates(monkeypatch):
@@ -554,43 +542,6 @@ def test_path_overlap_cases():
 
 
 # ---------------------------------------------------------------------------
-# call_anthropic retry
-# ---------------------------------------------------------------------------
-def test_call_anthropic_retries_on_429(monkeypatch):
-    n = {"calls": 0}
-
-    class R:
-        def read(self):
-            return json.dumps({"content": [{"type": "tool_use", "name": "emit_findings",
-                              "input": {"findings": [{"item_ref": "c0"}]}}]}).encode()
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-
-    def fake_urlopen(req, timeout=0):
-        n["calls"] += 1
-        if n["calls"] < 3:
-            raise ir.urllib.error.HTTPError(ir.ANTHROPIC_URL, 429, "rate", None, None)
-        return R()
-
-    monkeypatch.setattr(ir.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(ir.time, "sleep", lambda *a: None)
-    out = ir.call_anthropic("s", "u", "k")
-    assert n["calls"] == 3 and out[0]["item_ref"] == "c0"
-
-
-def test_call_anthropic_raises_on_non_retryable(monkeypatch):
-    def fake_urlopen(req, timeout=0):
-        raise ir.urllib.error.HTTPError(ir.ANTHROPIC_URL, 401, "unauth", None,
-                                        __import__("io").BytesIO(b'{"error":"bad key"}'))
-
-    monkeypatch.setattr(ir.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(ir.time, "sleep", lambda *a: None)
-    with pytest.raises(RuntimeError):
-        ir.call_anthropic("s", "u", "k")
-
-
 # ---------------------------------------------------------------------------
 # render flag order
 # ---------------------------------------------------------------------------
@@ -656,6 +607,8 @@ def test_main_flags_removed_invariant_via_origin(tmp_path, monkeypatch):
 
 def test_main_skips_without_secret(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(ir.llm_client, "resolve_config", lambda *a, **kw: None)
     assert ir.main() == 0  # fork PR / no secret -> never block
 
 

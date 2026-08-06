@@ -133,6 +133,19 @@ Resolution order when no config file and no env overrides (backward compat):
   the new provider path takes effect in a project only after this change is
   merged to its base branch.
 
+## Security
+
+In CI (`GITHUB_ACTIONS` set), `.archie/models.json` is read from the PR-head
+checkout — attacker-controlled — while `llm_client.py` itself runs from the
+trusted base ref with real secrets (`GITHUB_TOKEN`, provider API keys) in the
+environment. If the file's `base_url`/`api_key_env` were honored in CI, a
+malicious PR could point the client at an attacker-controlled endpoint and
+name `GITHUB_TOKEN` as the key to send it. `resolve_config` therefore ignores
+`base_url` and `api_key_env` from the file when `GITHUB_ACTIONS` is set,
+keeping only `provider`/`models`/`enabled` from the file; `ARCHIE_LLM_BASE_URL`
+/ `ARCHIE_LLM_API_KEY_ENV` env overrides (workflow-controlled) and built-in
+provider defaults remain fully honored. Outside CI the file is trusted as-is.
+
 ## Error handling
 
 - Missing/empty API key for the resolved provider → return empty result;

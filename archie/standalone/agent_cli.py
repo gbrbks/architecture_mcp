@@ -17,7 +17,10 @@ fully CLI-agnostic itself.
 
 Like the rest of `archie/standalone/`, this shells out to a CLI rather than
 importing a vendor SDK — keeps the zero-dependency invariant and inherits the
-user's existing auth.
+user's existing auth. When no coding-agent CLI is available (e.g. CI), it
+falls back to a direct LLM API call via `llm_client`, which resolves any
+OpenAI-compatible endpoint (OpenRouter, Anthropic, etc.) from project/env
+config.
 """
 
 from __future__ import annotations
@@ -28,47 +31,25 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import llm_client  # noqa: E402
 
 CLAUDE_CLI = "claude"
 CODEX_CLI = "codex"
 DEFAULT_TIMEOUT = 90  # seconds
 
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-API_MODEL = "claude-haiku-4-5"
-# Model-alias → concrete API id, for callers that request a heavier role (the
-# invariant specialist's Sonnet tracer / Opus challenger, design §6.6a). The CLI
-# path passes the alias straight to `claude --model`; the API path maps here.
-API_MODELS = {
-    "haiku": "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-8",
-}
 
-
-def _run_api(prompt: str, api_key: str, timeout: int = DEFAULT_TIMEOUT,
-             model: str = "haiku") -> str:
-    """Direct Anthropic Messages API call — used in CI where no coding-agent CLI exists.
-    Returns the text response or '' on any error."""
-    body = json.dumps({
-        "model": API_MODELS.get(model, API_MODEL),
-        "max_tokens": 4096,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        ANTHROPIC_URL, data=body, method="POST",
-        headers={"content-type": "application/json", "x-api-key": api_key,
-                 "anthropic-version": "2023-06-01"})
+def _run_api(prompt: str, timeout: int = DEFAULT_TIMEOUT, model: str = "haiku",
+             project_root=None) -> str:
+    """Direct LLM API call via llm_client — used in CI where no coding-agent
+    CLI exists. Returns the text response or '' on any error (fail-open)."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-        parts = data.get("content") or []
-        return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-    except Exception as e:
-        # A silent "" here is indistinguishable from "the reviewer found nothing".
-        print(f"[archie] api call failed ({type(e).__name__}: {e})", file=sys.stderr)
+        return llm_client.complete(prompt, tier=model, timeout=timeout,
+                                   project_root=project_root)["text"]
+    except llm_client.LLMError as e:
+        print(f"[archie] api call failed ({e})", file=sys.stderr)
         return ""
 
 
@@ -150,55 +131,19 @@ def _exec_tool(root, name, args):
     return "denied: unknown tool"
 
 
-def _run_api_tools(prompt, api_key, project_root, model="haiku",
+def _run_api_tools(prompt, project_root, model="haiku",
                    timeout=DEFAULT_TIMEOUT, max_turns=6, budget_bytes=60000) -> str:
-    """Messages-API tool-use loop offering jailed read_file/grep against
-    project_root — lets the CI verifier (no coding-agent CLI, direct API
-    fallback) check claims against the actual checkout instead of trusting
-    the prompt's citations blind. Hard-capped on turns and tool-output bytes;
-    degrades to the last seen text on any cap or error, never raises."""
-    messages = [{"role": "user", "content": prompt}]
-    spent = 0
-    last_text = ""
-    for _ in range(max_turns):
-        body = json.dumps({
-            "model": API_MODELS.get(model, API_MODEL),
-            "max_tokens": 4096,
-            "tools": _TOOLS,
-            "messages": messages,
-        }).encode()
-        req = urllib.request.Request(
-            ANTHROPIC_URL, data=body, method="POST",
-            headers={"content-type": "application/json", "x-api-key": api_key,
-                     "anthropic-version": "2023-06-01"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
-        except Exception:
-            return last_text
-        content = data.get("content") or []
-        last_text = "".join(b.get("text", "") for b in content if b.get("type") == "text") or last_text
-        if data.get("stop_reason") != "tool_use":
-            return last_text
-        messages.append({"role": "assistant", "content": content})
-        results = []
-        for b in content:
-            if b.get("type") != "tool_use":
-                continue
-            if spent >= budget_bytes:
-                out = "denied: tool budget exhausted"
-            else:
-                try:
-                    out = _exec_tool(project_root, b.get("name"), b.get("input") or {})
-                except Exception:
-                    # Tool input is model-controlled (e.g. a non-numeric
-                    # start_line); a malformed call must degrade the tool
-                    # result, not blow up the whole verifier run.
-                    out = "denied: tool call failed"
-                spent += len(out)
-            results.append({"type": "tool_result", "tool_use_id": b.get("id"), "content": out})
-        messages.append({"role": "user", "content": results})
-    return last_text
+    """LLM tool-use loop offering jailed read_file/grep against project_root
+    (see _exec_tool). Fail-open: returns '' or last seen text, never raises."""
+    try:
+        return llm_client.complete(
+            prompt, tier=model, timeout=timeout, project_root=project_root,
+            tools=_TOOLS, max_turns=max_turns, budget_bytes=budget_bytes,
+            tool_executor=lambda name, args: _exec_tool(project_root, name, args),
+        )["text"]
+    except llm_client.LLMError as e:
+        print(f"[archie] api tool loop failed ({e})", file=sys.stderr)
+        return ""
 
 
 def detect_cli() -> str:
@@ -249,19 +194,20 @@ def run_verifier(prompt: str, project_root: Path, verifier: str,
     Priority:
     1. Requested codex CLI (if verifier=='codex' and codex is on PATH).
     2. claude CLI (if available on PATH).
-    3. Direct Anthropic API (if ANTHROPIC_API_KEY is set) — CI fallback where
-       no coding-agent CLI is installed.
+    3. Direct LLM API via `llm_client` (OpenRouter / any OpenAI-compatible
+       endpoint / Anthropic — resolved from `.archie/models.json`,
+       `ARCHIE_LLM_*`, or `OPENROUTER_API_KEY`/`ANTHROPIC_API_KEY`) — CI
+       fallback where no coding-agent CLI is installed.
     4. Empty string — nothing available.
     """
     if verifier == "codex" and shutil.which("codex"):
         return _run_codex(prompt, project_root, timeout)
     if shutil.which("claude"):
         return _run_claude(prompt, project_root, timeout, model=model)
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
+    if llm_client.resolve_config(project_root) is not None:
         if tools:
-            return _run_api_tools(prompt, key, project_root, model=model, timeout=timeout)
-        return _run_api(prompt, key, timeout, model=model)
+            return _run_api_tools(prompt, project_root, model=model, timeout=timeout)
+        return _run_api(prompt, timeout, model=model, project_root=project_root)
     return ""
 
 

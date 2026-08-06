@@ -453,9 +453,11 @@ def run_pr_gate(root=".", env=None):
     retired, judged = [], {}
     try:
         import contract_delta as _cd
+        import llm_client as _llm
         retired = _cd.retirements(root)
         base_ref_full = pr_meta.get("base_sha") or f"origin/{env.get('GITHUB_BASE_REF', '')}"
-        judged = _cd.judged_changes(root, base_ref_full, env.get("ANTHROPIC_API_KEY", ""))
+        api_key = (_llm.resolve_config(root, env) or {}).get("api_key", "")
+        judged = _cd.judged_changes(root, base_ref_full, api_key)
     except Exception as e:
         print(f"[archie] contract delta failed ({e})")
 

@@ -199,6 +199,65 @@ def test_run_pr_gate_uses_real_changed_lines(tmp_path, monkeypatch):
     )
 
 
+def test_run_pr_gate_sources_contract_delta_key_from_llm_client(tmp_path, monkeypatch):
+    """Contract-delta judging must use llm_client.resolve_config()'s api_key, not a raw
+    ANTHROPIC_API_KEY env read — with only a non-Anthropic provider configured (e.g.
+    OPENROUTER_API_KEY), resolve_config() still returns a usable key and judging must
+    not silently skip."""
+    root = tmp_path
+    _git(root, "init")
+    _git(root, "config", "user.email", "t@t.t")
+    _git(root, "config", "user.name", "t")
+    (root / "svc.py").write_text("a = 1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "init")
+    base_sha = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+    (root / "svc.py").write_text("a = 1\nb = 2\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "change")
+
+    event = root / "event.json"
+    event.write_text(json.dumps({
+        "pull_request": {
+            "number": 3, "changed_files": 1, "user": {"login": "human"},
+            "base": {"ref": "main", "sha": base_sha}, "head": {"sha": "HEAD"},
+            "labels": [],
+        }
+    }))
+
+    import review_core as core
+    monkeypatch.setattr(core, "review_conformance", lambda *a, **k: [])
+    monkeypatch.setattr(core, "behavioral_review_run", lambda *a, **k: [])
+    monkeypatch.setattr(core, "review_invariants", lambda *a, **k: [])
+    import universal_specialists as us
+    monkeypatch.setattr(us, "review_one", lambda *a, **k: [])
+    import intent_review as ir
+    monkeypatch.setattr(ir, "post_or_update_comment", lambda *a, **k: None)
+
+    import contract_delta as cd
+    captured = {}
+
+    def fake_judged_changes(root, base_ref_full, api_key):
+        captured["api_key"] = api_key
+        return {}
+    monkeypatch.setattr(cd, "retirements", lambda root: [])
+    monkeypatch.setattr(cd, "judged_changes", fake_judged_changes)
+
+    import llm_client
+    monkeypatch.setattr(llm_client, "resolve_config",
+                         lambda *a, **k: {"api_key": "sk-x", "models": {}})
+
+    env = {"GITHUB_EVENT_PATH": str(event), "GITHUB_TOKEN": "t",
+           "GITHUB_REPOSITORY": "o/r"}
+    env.pop("ANTHROPIC_API_KEY", None)
+    dr.run_pr_gate(str(root), env)
+
+    assert captured.get("api_key") == "sk-x", (
+        f"judged_changes should receive the llm_client-resolved key, got: {captured}"
+    )
+
+
 # J2 — comment-injection / crash hardening
 def test_sanitize_strips_newlines():
     """A field with embedded newlines cannot open a second Markdown block /

@@ -27,20 +27,17 @@ import json
 import os
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import IgnoreMatcher, file_sha1, is_source_path  # noqa: E402
+import llm_client  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # constants
 # ---------------------------------------------------------------------------
-MODEL = "claude-haiku-4-5"
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
 MAX_TOKENS = 4096
 COMMENT_MARKER = "<!-- archie-intent-review -->"
 GITHUB_API = "https://api.github.com"
@@ -580,53 +577,24 @@ def build_prompt(changed_items: list, retained: list, claims: list) -> tuple:
 
 
 def call_anthropic(system: str, user: str, api_key: str, max_retries: int = 3) -> list:
-    """POST one Messages request forcing the emit_findings tool. Return the raw
-    findings list from the model (judgment only). Raises RuntimeError on hard failure.
+    """One forced-tool completion returning the raw findings list.
+
+    Name kept for compatibility (contract_delta imports it); routing is now
+    provider-agnostic via llm_client (OpenRouter / OpenAI-compatible /
+    Anthropic). `api_key` is legacy — the client resolves the real key from
+    config/env — but an empty value still means "skip", matching old callers.
+    Raises RuntimeError on hard failure.
     """
-    body = json.dumps({
-        "model": MODEL,
-        "max_tokens": MAX_TOKENS,
-        "system": system,
-        "tools": [EMIT_FINDINGS_TOOL],
-        "tool_choice": {"type": "tool", "name": "emit_findings"},
-        "messages": [{"role": "user", "content": user}],
-    }).encode("utf-8")
-
-    last_err = None
-    for attempt in range(max_retries):
-        req = urllib.request.Request(ANTHROPIC_URL, data=body, method="POST", headers={
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            return _extract_findings(payload)
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code}"
-            if e.code in (429, 500, 502, 503, 529) and attempt < max_retries - 1:
-                retry_after = e.headers.get("Retry-After") if e.headers else None
-                delay = float(retry_after) if retry_after and retry_after.isdigit() \
-                    else min(2 ** attempt, 30)
-                time.sleep(delay)
-                continue
-            raise RuntimeError(f"Anthropic API error: {last_err}: {e.read().decode('utf-8', 'replace')[:300]}")
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = str(e)
-            if attempt < max_retries - 1:
-                time.sleep(min(2 ** attempt, 30))
-                continue
-            raise RuntimeError(f"Anthropic API unreachable: {last_err}")
-    raise RuntimeError(f"Anthropic API failed: {last_err}")
-
-
-def _extract_findings(api_response: dict) -> list:
-    """Pull the emit_findings tool_use input out of a Messages response."""
-    for block in (api_response.get("content") or []):
-        if block.get("type") == "tool_use" and block.get("name") == "emit_findings":
-            inp = block.get("input") or {}
-            findings = inp.get("findings")
+    try:
+        result = llm_client.complete(
+            user, system=system, tier="haiku", max_tokens=MAX_TOKENS,
+            tools=[EMIT_FINDINGS_TOOL], tool_choice="emit_findings",
+            max_retries=max_retries)
+    except llm_client.LLMError as e:
+        raise RuntimeError(f"LLM API failed: {e}")
+    for call in result["tool_calls"]:
+        if call["name"] == "emit_findings":
+            findings = call["input"].get("findings")
             return findings if isinstance(findings, list) else []
     return []
 
@@ -959,10 +927,11 @@ def main(argv=None) -> int:
     env = os.environ
 
     # 1. Fork-PR / no-secret guard FIRST — before any GitHub write.
-    api_key = env.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        print("[intent-review] ANTHROPIC_API_KEY not set (fork PR?) — skipping.", file=sys.stderr)
+    if llm_client.resolve_config() is None:
+        print("[intent-review] no LLM provider configured (set OPENROUTER_API_KEY "
+              "or ANTHROPIC_API_KEY) (fork PR?) — skipping.", file=sys.stderr)
         return 0
+    api_key = env.get("ANTHROPIC_API_KEY", "").strip() or env.get("OPENROUTER_API_KEY", "").strip()
 
     ctx = parse_event_context(env)
     if ctx is None:

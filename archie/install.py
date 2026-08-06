@@ -55,7 +55,7 @@ _STANDALONE_SCRIPTS = [
     "finalize.py", "merge.py", "measure_health.py", "detect_cycles.py",
     "extract_output.py", "arch_review.py", "align_check.py",
     "check_rules.py", "code_shape.py", "rule_index.py", "lint_gate.py",
-    "agent_cli.py", "verify_findings.py", "apply_verdicts.py", "migrate_blueprint_rules.py",
+    "agent_cli.py", "llm_client.py", "verify_findings.py", "apply_verdicts.py", "migrate_blueprint_rules.py",
     "rule_kinds.py", "backfill_kinds.py",
     "telemetry.py", "telemetry_sync.py",
     "analytics.py", "config.py",
